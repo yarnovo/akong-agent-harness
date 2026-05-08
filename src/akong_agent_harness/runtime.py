@@ -24,9 +24,12 @@ from typing import Any
 import httpx
 from openai import OpenAI
 
+from .llm import ChatResponse, LLMClient, LLMError
 from .memory import DEFAULT_API_BASE_URL, Memory, RdsAdapter, MemoryEntry
+from .session import Session, SessionUnavailable
 from .skills import Skill, SkillRegistry, default_registry as _default_skill_registry
 from .tools import ToolNotRegisteredError, ToolSpec, Tools
+from .workspace import Workspace
 
 
 DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -438,3 +441,287 @@ def tick(
     result.next_wakeup = state["next_wakeup"]
     result.stopped = bool(state["stopped"])
     return result
+
+
+# === 新 API · runtime.run() (老板 5-7 拍 · 5-8 砍 streaming) ===
+#
+# run() = 多轮 tool use loop · sync 一次性返 RunResult · 不 yield · 不 SSE
+# 跟 OpenCode processGeneration 同 pattern (while stop_reason==tool_use loop)
+# 老 tick() 不动 · cast-app /create 现链路依赖
+#
+
+
+@dataclass
+class AgentDef:
+    """agent 静态定义 (跟 cast-api agent row 对齐 · 但 run() 不强依赖 6 件套 fetch)
+
+    runtime.run 直接接受这个 dataclass · 由 caller 自己拼 (从 cast-api 拉 / 测试 mock / 配置文件)。
+    跟老 tick 内部 _AgentBundle 的差别: run() 不再拉 memory_recent / tools list / agent record · caller 自决。
+    """
+
+    id: str
+    name: str = ""
+    tagline: str = ""
+    soul: str = ""
+    playbook: str = ""
+    style: str = ""
+    skills: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RunResult:
+    """run() 一次性返 · 跑完所有 turn 后给 caller。
+
+    messages   · 整轮 (含 system + user + assistant + tool 中间消息) · 可整体 append 到 session
+    final_text · 最后一条 assistant content (LLM 给的回答文本)
+    stop_reason· 'end_turn' (LLM 自然停) | 'max_turns' (打到上限) | 'harness_stop' (LLM 调 stop_for_now) | 'error'
+    turns_used · 实际跑了几轮 LLM call
+    actions    · 每个 tool call (含 builtin) 的执行记录 · 跟老 tick.actions 同 schema
+    usage      · token 累计 (按 ChatResponse.usage 各轮加)
+    error      · 任何未捕获异常字符串
+    """
+
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    final_text: str = ""
+    stop_reason: str = "end_turn"
+    turns_used: int = 0
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    usage: dict[str, int] = field(default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    error: str | None = None
+
+
+def _build_system_prompt_from_agent(
+    agent: AgentDef,
+    skills: list[Skill] | None,
+    memory_recent: list[MemoryEntry] | None,
+) -> str:
+    """run() 用 · 接 AgentDef + skills/memory · 跟老 _build_system_prompt 等价但 input 不同"""
+    parts: list[str] = []
+    parts.append(f"# 你是 {agent.name or 'agent'} (id={agent.id})")
+    if agent.tagline:
+        parts.append(f"\n**简介**: {agent.tagline}")
+    if agent.soul:
+        parts.append(f"\n## soul · 人设\n\n{agent.soul}")
+    if agent.playbook:
+        parts.append(f"\n## playbook · 守则\n\n{agent.playbook}")
+    if agent.style:
+        parts.append(f"\n## style · 文风\n\n{agent.style}")
+    if memory_recent:
+        parts.append("\n## 最近记忆 (倒序)\n")
+        for m in memory_recent:
+            ts = m.created_at.isoformat() if isinstance(m.created_at, datetime) else m.created_at
+            parts.append(f"- [{m.kind} · {ts}] {m.content}")
+    if skills:
+        parts.append("\n## 已装载 skills (业务能力 · 按需触发)\n")
+        for skill in skills:
+            parts.append(f"\n## skill: {skill.name}\n")
+            if skill.description:
+                parts.append(f"_{skill.description}_\n")
+            if skill.prompt:
+                parts.append(skill.prompt)
+    return "\n".join(parts)
+
+
+async def run(
+    *,
+    agent: AgentDef,
+    user_message: str,
+    session: Session,
+    llm_client: LLMClient,
+    workspace: Workspace | None = None,
+    memory: Memory | None = None,
+    tools: Tools | None = None,
+    skills: SkillRegistry | None = None,
+    max_turns: int = 10,
+) -> RunResult:
+    """harness 多轮 tool use loop · sync return (老板 5-8 砍 streaming)
+
+    步骤:
+      1. session.load() → 拼 system + history + new user_message
+      2. while turn < max_turns:
+           a. llm_client.chat_completion(messages, tools)  # sync · 不 stream
+           b. session.append(assistant_msg) · accumulate
+           c. if stop_reason == 'tool_use' & tool_calls 非空: 执行每个 tool · session.append(tool_result) · continue
+           d. else: break (end_turn / harness_stop / 其它)
+      3. 返 RunResult
+
+    跟 OpenCode processGeneration 同 pattern。tool 执行错误捕获 · 写回 session 让 LLM 自纠。
+    """
+    result = RunResult()
+
+    # 拼 skills 列表 (slug → Skill)
+    skill_objs: list[Skill] = []
+    if skills is not None:
+        for slug in agent.skills:
+            s = skills.get(slug)
+            if s is not None:
+                skill_objs.append(s)
+
+    # 拉 recent memory (best-effort · 失败不 break)
+    memory_recent: list[MemoryEntry] = []
+    if memory is not None:
+        try:
+            memory_recent = memory.recent(limit=20)
+        except Exception:
+            memory_recent = []
+
+    # 拉 platform tools (best-effort)
+    tool_specs: list[ToolSpec] = []
+    if tools is not None:
+        try:
+            tool_specs = tools.list()
+        except Exception:
+            tool_specs = []
+
+    system_prompt = _build_system_prompt_from_agent(agent, skill_objs, memory_recent)
+    tool_specs_openai = [s.to_openai_function() for s in tool_specs] + _builtin_tools()
+
+    # session.load → existing history (含上次的 user/assistant/tool · 不含 system)
+    try:
+        history = await session.load()
+    except SessionUnavailable as e:
+        result.error = f"session unavailable: {e}"
+        result.stop_reason = "error"
+        return result
+    except Exception as e:
+        result.error = f"session load failed: {e}"
+        result.stop_reason = "error"
+        return result
+
+    # append 当前 user message · 同 session 持久化
+    new_user = {"role": "user", "content": user_message}
+    try:
+        await session.append(new_user)
+    except Exception as e:
+        result.error = f"session append user failed: {e}"
+        result.stop_reason = "error"
+        return result
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *history, new_user]
+    state = {"next_wakeup": None, "stopped": False}
+
+    api_base_url = os.environ.get("AKONG_API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/")
+
+    final_text = ""
+    stop_reason_final = "end_turn"
+
+    for turn in range(max_turns):
+        result.turns_used = turn + 1
+        try:
+            chat_resp: ChatResponse = await llm_client.chat_completion(
+                messages=messages,
+                tools=tool_specs_openai if tool_specs_openai else None,
+            )
+        except LLMError as e:
+            result.error = f"LLM call failed (turn {turn}): {e}"
+            stop_reason_final = "error"
+            break
+        except Exception as e:
+            result.error = f"LLM unexpected error (turn {turn}): {e}"
+            stop_reason_final = "error"
+            break
+
+        # 累 token
+        result.usage["prompt_tokens"] += chat_resp.usage.prompt_tokens
+        result.usage["completion_tokens"] += chat_resp.usage.completion_tokens
+        result.usage["total_tokens"] += chat_resp.usage.total_tokens
+
+        assistant_msg = chat_resp.to_message_dict()
+        messages.append(assistant_msg)
+        try:
+            await session.append(assistant_msg)
+        except Exception as e:
+            result.error = f"session append assistant failed: {e}"
+            stop_reason_final = "error"
+            break
+
+        if chat_resp.content:
+            final_text = chat_resp.content
+
+        # 没 tool call → LLM 自然停
+        if not chat_resp.tool_calls:
+            stop_reason_final = "end_turn"
+            break
+
+        # 执行每个 tool call · result 写回 session
+        for tc in chat_resp.tool_calls:
+            fn_name = tc.name
+            try:
+                args = json.loads(tc.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+
+            handled, res = _handle_builtin(
+                fn_name,
+                args,
+                agent_id=agent.id,
+                memory=memory if memory is not None else _NoopMemory(),
+                api_base_url=api_base_url,
+                state=state,
+            )
+            if not handled:
+                tool_id = _decode_tool_name(fn_name)
+                if tools is None:
+                    res = {"ok": False, "error": "tools registry not provided"}
+                else:
+                    try:
+                        res = tools.call(tool_id, **args)
+                    except ToolNotRegisteredError as e:
+                        res = {"ok": False, "error": str(e)}
+                    except Exception as e:
+                        res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(res, ensure_ascii=False, default=str),
+            }
+            messages.append(tool_msg)
+            try:
+                await session.append(tool_msg)
+            except Exception as e:
+                # session 挂了不阻塞 · 但记录
+                result.error = f"session append tool failed: {e}"
+
+            result.actions.append(
+                {"tool_id": _decode_tool_name(fn_name), "args": args, "result": res}
+            )
+
+        # builtin stop_for_now → 立刻停
+        if state["stopped"]:
+            stop_reason_final = "harness_stop"
+            break
+
+        # 否则继续 next turn (LLM 看到 tool result 再决定)
+    else:
+        # for-else: max_turns 跑完没 break · 打到上限
+        stop_reason_final = "max_turns"
+
+    result.messages = messages
+    result.final_text = final_text
+    result.stop_reason = stop_reason_final
+    return result
+
+
+class _NoopMemory:
+    """memory=None 时的兜底 · _handle_builtin 强需要 memory · 给个 noop"""
+
+    def append(self, kind: str, content: str, metadata: dict[str, Any] | None = None) -> Any:
+        from .memory import MemoryEntry as _ME
+
+        return _ME(
+            id="noop",
+            kind=kind,
+            content=content,
+            created_at=datetime.now(timezone.utc),
+        )
+
+    def recent(self, kind: str | None = None, limit: int = 20) -> list[Any]:
+        return []
+
+    def search(self, query: str, limit: int = 5) -> list[Any]:
+        return []
+
+    def snapshot(self) -> None:
+        return None
