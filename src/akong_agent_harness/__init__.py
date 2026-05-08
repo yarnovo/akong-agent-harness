@@ -13,7 +13,18 @@
 
 from . import workspace as _workspace
 from . import memory as _memory
+from . import session as _session
 from . import tools as _tools
+from .llm import (
+    AnthropicClient,
+    ChatResponse,
+    LLMClient,
+    LLMError,
+    OpenAICompatibleClient,
+    ToolCall as LLMToolCall,
+    Usage as LLMUsage,
+    connect as connect_llm,
+)
 from .memory import (
     Memory,
     MemoryEntry,
@@ -21,11 +32,21 @@ from .memory import (
     RdsAdapter,
 )
 from .runtime import (
+    AgentDef,
     DEFAULT_LLM_BASE_URL,
     DEFAULT_LLM_MODEL,
+    RunResult,
     TickResult,
     Trigger,
+    run,
     tick,
+)
+from .session import (
+    InMemorySession,
+    RdsSession,
+    Session,
+    SessionError,
+    SessionUnavailable,
 )
 from .skills import (
     Skill,
@@ -58,26 +79,38 @@ class _MemoryFactory:
     connect = staticmethod(_memory.connect)
 
 
-# Workspace / Memory 是 Protocol · attach 工厂方法到模块级名字
+# Workspace / Memory / Session 是 Protocol · attach 工厂方法到模块级名字
 # 用法: from akong_agent_harness import Workspace; Workspace.connect("ag_x")
 Workspace.connect = staticmethod(_workspace.connect)  # type: ignore[attr-defined]
 Memory.connect = staticmethod(_memory.connect)  # type: ignore[attr-defined]
+Session.connect = staticmethod(_session.connect)  # type: ignore[attr-defined]
 
 
 __all__ = [
     # interfaces
     "Workspace",
     "Memory",
+    "Session",
     "Tools",
     "ToolsApi",
+    "LLMClient",
     # data classes
     "MemoryEntry",
     "ToolSpec",
     "Trigger",
     "TickResult",
+    "AgentDef",
+    "RunResult",
+    "ChatResponse",
+    "LLMToolCall",
+    "LLMUsage",
     # adapters
     "LocalFsAdapter",
     "RdsAdapter",
+    "InMemorySession",
+    "RdsSession",
+    "OpenAICompatibleClient",
+    "AnthropicClient",
     # skills
     "Skill",
     "SkillRegistry",
@@ -87,12 +120,18 @@ __all__ = [
     "register_tool",
     # runtime
     "tick",
+    "run",
+    # factories
+    "connect_llm",
     # errors
     "WorkspaceError",
     "MemoryError",
     "ToolError",
     "ToolNotRegisteredError",
     "SkillError",
+    "SessionError",
+    "SessionUnavailable",
+    "LLMError",
     # constants
     "DEFAULT_LLM_BASE_URL",
     "DEFAULT_LLM_MODEL",
