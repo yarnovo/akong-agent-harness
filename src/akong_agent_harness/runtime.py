@@ -76,7 +76,7 @@ def _fetch_agent_bundle(
     memory_recent_limit: int = 20,
     timeout: float = 10.0,
 ) -> _AgentBundle:
-    with httpx.Client(base_url=api_base_url.rstrip("/"), timeout=timeout) as client:
+    with httpx.Client(base_url=api_base_url.rstrip("/"), timeout=timeout, trust_env=False) as client:
         resp = client.get(f"/api/agents/{agent_id}")
         if resp.status_code >= 400:
             raise RuntimeError(f"GET /api/agents/{agent_id} → {resp.status_code} {resp.text[:200]}")
@@ -194,7 +194,7 @@ def _handle_builtin(
             "reason": args.get("reason"),
             "changed_by": "self",
         }
-        with httpx.Client(base_url=api_base_url.rstrip("/"), timeout=10.0) as client:
+        with httpx.Client(base_url=api_base_url.rstrip("/"), timeout=10.0, trust_env=False) as client:
             resp = client.post(f"/api/agents/{agent_id}/update-self", json=body)
         if resp.status_code >= 400:
             return True, {"ok": False, "error": f"{resp.status_code} {resp.text[:200]}"}

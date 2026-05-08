@@ -71,7 +71,7 @@ class RdsAdapter:
             raise ValueError("agent_id required")
         self.agent_id = agent_id
         self.api_base_url = (api_base_url or os.environ.get("AKONG_API_BASE_URL", DEFAULT_API_BASE_URL)).rstrip("/")
-        self._client = httpx.Client(base_url=self.api_base_url, timeout=timeout)
+        self._client = httpx.Client(base_url=self.api_base_url, timeout=timeout, trust_env=False)
         self._max_retries = max_retries
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
