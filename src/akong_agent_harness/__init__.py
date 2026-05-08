@@ -27,6 +27,13 @@ from .runtime import (
     Trigger,
     tick,
 )
+from .skills import (
+    Skill,
+    SkillError,
+    SkillRegistry,
+    default_registry as default_skill_registry,
+    parse_skill_md,
+)
 from .tools import (
     ToolError,
     ToolNotRegisteredError,
@@ -71,6 +78,11 @@ __all__ = [
     # adapters
     "LocalFsAdapter",
     "RdsAdapter",
+    # skills
+    "Skill",
+    "SkillRegistry",
+    "default_skill_registry",
+    "parse_skill_md",
     # registration
     "register_tool",
     # runtime
@@ -80,6 +92,7 @@ __all__ = [
     "MemoryError",
     "ToolError",
     "ToolNotRegisteredError",
+    "SkillError",
     # constants
     "DEFAULT_LLM_BASE_URL",
     "DEFAULT_LLM_MODEL",

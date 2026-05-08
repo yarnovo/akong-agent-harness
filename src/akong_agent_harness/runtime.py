@@ -25,6 +25,7 @@ import httpx
 from openai import OpenAI
 
 from .memory import DEFAULT_API_BASE_URL, Memory, RdsAdapter, MemoryEntry
+from .skills import Skill, SkillRegistry, default_registry as _default_skill_registry
 from .tools import ToolNotRegisteredError, ToolSpec, Tools
 
 
@@ -60,11 +61,49 @@ class TickResult:
 
 @dataclass
 class _AgentBundle:
-    """从 cast-api 拉出来的 6 件套 (identity + playbook + memory + tools + state)"""
+    """从 cast-api 拉出来的 6 件套 (identity + playbook + memory + tools + state) + skills"""
 
     agent: dict[str, Any]
     memory_recent: list[MemoryEntry]
     tools: list[ToolSpec]
+    skills: list[Skill] = field(default_factory=list)
+
+
+def _resolve_agent_skill_slugs(agent: dict[str, Any]) -> list[str]:
+    """从 agent record 解析 skills slug 列表
+
+    cast-api 当前没原生 skills 字段 (走 metadata_json 字段) · 也兼容 agent['skills'] 直传。
+    """
+    raw = agent.get("skills")
+    if raw is None:
+        meta = agent.get("metadata_json")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        if isinstance(meta, dict):
+            raw = meta.get("skills")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(s) for s in raw]
+    if isinstance(raw, str):
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    return []
+
+
+def _load_skills_for_agent(
+    agent: dict[str, Any],
+    registry: SkillRegistry,
+) -> list[Skill]:
+    """按 agent.skills slug 列表 · 调 registry.get · 拿到 Skill 对象 (不存在静默跳过)"""
+    skills: list[Skill] = []
+    for slug in _resolve_agent_skill_slugs(agent):
+        skill = registry.get(slug)
+        if skill is not None:
+            skills.append(skill)
+    return skills
 
 
 def _fetch_agent_bundle(
@@ -75,6 +114,7 @@ def _fetch_agent_bundle(
     *,
     memory_recent_limit: int = 20,
     timeout: float = 10.0,
+    skill_registry: SkillRegistry | None = None,
 ) -> _AgentBundle:
     with httpx.Client(base_url=api_base_url.rstrip("/"), timeout=timeout, trust_env=False) as client:
         resp = client.get(f"/api/agents/{agent_id}")
@@ -83,7 +123,9 @@ def _fetch_agent_bundle(
         agent_data = resp.json()
     recent = memory.recent(limit=memory_recent_limit)
     tool_specs = tools.list()
-    return _AgentBundle(agent=agent_data, memory_recent=recent, tools=tool_specs)
+    registry = skill_registry or _default_skill_registry()
+    skills = _load_skills_for_agent(agent_data, registry)
+    return _AgentBundle(agent=agent_data, memory_recent=recent, tools=tool_specs, skills=skills)
 
 
 def _build_system_prompt(bundle: _AgentBundle) -> str:
@@ -103,7 +145,47 @@ def _build_system_prompt(bundle: _AgentBundle) -> str:
         for m in bundle.memory_recent:
             ts = m.created_at.isoformat() if isinstance(m.created_at, datetime) else m.created_at
             parts.append(f"- [{m.kind} · {ts}] {m.content}")
+    if bundle.skills:
+        parts.append("\n## 已装载 skills (业务能力 · 按需触发)\n")
+        for skill in bundle.skills:
+            parts.append(f"\n## skill: {skill.name}\n")
+            if skill.description:
+                parts.append(f"_{skill.description}_\n")
+            if skill.prompt:
+                parts.append(skill.prompt)
     return "\n".join(parts)
+
+
+def _merge_tool_specs(
+    platform_specs: list[ToolSpec],
+    skills: list[Skill],
+) -> list[ToolSpec]:
+    """合并 6 件套基础 tools + skill 引的 tools (去重 · platform spec 优先)
+
+    skill 只声明 tool id 字符串 · 真 spec 来自平台 registry (cast-api 返回)。
+    若 skill 引了 platform 没注册的 tool id · 静默忽略 (LLM tool 列表里不出现)。
+    """
+    by_id: dict[str, ToolSpec] = {s.id: s for s in platform_specs}
+    available = {s.id for s in platform_specs}
+    referenced: set[str] = set()
+    for skill in skills:
+        for tool_id in skill.tools:
+            if tool_id.startswith("harness."):
+                # harness 自带 tool · runtime 单独注 builtin · 不进 spec list
+                continue
+            referenced.add(tool_id)
+    # 当前实现: skill 引的 tool 必须在 platform spec 里 · 没找到的丢
+    final: list[ToolSpec] = []
+    seen: set[str] = set()
+    for spec in platform_specs:
+        if spec.id in seen:
+            continue
+        seen.add(spec.id)
+        final.append(spec)
+    # skill 引的 tool 默认就在 platform_specs 里 (兼集) · 不再重复加
+    # 留扩展位: 未来 skill 可独立带 spec 时这里 union
+    _ = referenced, available, by_id
+    return final
 
 
 def _build_user_prompt(trigger: Trigger) -> str:
@@ -228,11 +310,12 @@ def tick(
     memory: Memory | None = None,
     tools: Tools | None = None,
     openai_client: Any | None = None,
+    skill_registry: SkillRegistry | None = None,
 ) -> TickResult:
     """harness 主循环 · 跑一轮 agent。
 
     生产用法只传 agent_id + trigger · 其他参数走 env / 默认。
-    测试可注入 memory / tools / openai_client。
+    测试可注入 memory / tools / openai_client / skill_registry。
     """
     api_base_url = (api_base_url or os.environ.get("AKONG_API_BASE_URL", DEFAULT_API_BASE_URL)).rstrip("/")
     llm_api_key = llm_api_key or os.environ.get("AKONG_LLM_API_KEY", "")
@@ -251,7 +334,13 @@ def tick(
     result = TickResult()
 
     try:
-        bundle = _fetch_agent_bundle(agent_id, api_base_url, memory, tools)
+        bundle = _fetch_agent_bundle(
+            agent_id,
+            api_base_url,
+            memory,
+            tools,
+            skill_registry=skill_registry,
+        )
     except Exception as e:
         result.error = f"fetch bundle failed: {e}"
         return result
@@ -265,8 +354,9 @@ def tick(
     ]
     result.messages = list(messages)
 
-    # 拼 tools list = 平台 tools (转 OpenAI 格式) + 4 个 harness builtin
-    tool_specs_openai = [s.to_openai_function() for s in bundle.tools] + _builtin_tools()
+    # 拼 tools list = 平台 tools + skill 引的 tools (去重 · merged) + 4 个 harness builtin
+    merged_specs = _merge_tool_specs(bundle.tools, bundle.skills)
+    tool_specs_openai = [s.to_openai_function() for s in merged_specs] + _builtin_tools()
 
     state = {"next_wakeup": None, "stopped": False}
 
