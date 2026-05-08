@@ -1,21 +1,24 @@
-"""通用 agent harness · LLM 周围的软件基础设施。
+"""akong-agent-harness · v0.2.0 META-PACKAGE (老板 5-9 激进版 8 仓拆 · 兼容层)
 
-参考 cast-agents/docs/architecture.md §2 (6 件套) + §3 (虚拟层 SDK)。
+⚠️ v0.2.0 起本仓不再 own 实现 · 8 仓拆出 · 本仓只 re-export · 老 import 仍兼容:
 
-3 个高层接口 (agent 一端只看这些 · 不直接读写 fs / DB / OSS):
-  - Workspace · agent 的"硬盘"
-  - Memory    · agent 的"长期记忆"
-  - Tools     · agent 能调的"动作"
+    from akong_agent_harness import (...)   # 老用法 · 走兼容 · 本仓 re-export
 
-1 个 runtime 入口:
-  - tick(agent_id, trigger) → TickResult
+新代码推荐直接 import 拆出来的子包:
+
+    from akong_llm import LLMClient, OpenAICompatibleClient
+    from akong_memory import RdsAdapter
+    from akong_session import RdsSession, InMemorySession
+    from akong_workspace import LocalFsAdapter
+    from akong_tools import register_tool, Tools
+    from akong_skills import SkillRegistry, parse_skill_md
+    from akong_runtime import run, tick, AgentDef, RunResult
+    from akong_pickup import run_with_pickup
 """
 
-from . import workspace as _workspace
-from . import memory as _memory
-from . import session as _session
-from . import tools as _tools
-from .llm import (
+# 兼容层: 把老的 sub-module path (akong_agent_harness.llm 等) 也转过去
+# 让 `from akong_agent_harness.llm import LLMClient` / `import akong_agent_harness.runtime as r` 仍工作
+from akong_llm import (
     AnthropicClient,
     ChatResponse,
     LLMClient,
@@ -25,13 +28,13 @@ from .llm import (
     Usage as LLMUsage,
     connect as connect_llm,
 )
-from .memory import (
+from akong_memory import (
     Memory,
     MemoryEntry,
     MemoryError,
     RdsAdapter,
 )
-from .runtime import (
+from akong_runtime import (
     AgentDef,
     DEFAULT_LLM_BASE_URL,
     DEFAULT_LLM_MODEL,
@@ -41,21 +44,21 @@ from .runtime import (
     run,
     tick,
 )
-from .session import (
+from akong_session import (
     InMemorySession,
     RdsSession,
     Session,
     SessionError,
     SessionUnavailable,
 )
-from .skills import (
+from akong_skills import (
     Skill,
     SkillError,
     SkillRegistry,
     default_registry as default_skill_registry,
     parse_skill_md,
 )
-from .tools import (
+from akong_tools import (
     ToolError,
     ToolNotRegisteredError,
     ToolSpec,
@@ -63,27 +66,33 @@ from .tools import (
     ToolsApi,
     register_tool,
 )
-from .workspace import (
+from akong_workspace import (
     LocalFsAdapter,
     Workspace,
     WorkspaceError,
 )
 
 
-# 工厂别名 · 让 Workspace.connect / Memory.connect / Tools.connect 三接口形态对齐
-class _WorkspaceFactory:
-    connect = staticmethod(_workspace.connect)
+# 老 sub-module path 兼容: akong_agent_harness.{llm,memory,session,workspace,skills,tools,runtime}
+# 让 `import akong_agent_harness.runtime as runtime_mod` 仍工作 (test_runtime_smoke 等)
+import sys as _sys
 
+# 用 inner module (xxx.xxx 含 httpx 等真实 imports 在文件级) 而不是 package · 让 patch xxx.httpx 仍可工作
+import akong_llm.llm as _llm_pkg
+import akong_memory.memory as _memory_pkg
+import akong_runtime.runtime as _runtime_pkg
+import akong_session.session as _session_pkg
+import akong_skills.skills as _skills_pkg
+import akong_tools.tools as _tools_pkg
+import akong_workspace.workspace as _workspace_pkg
 
-class _MemoryFactory:
-    connect = staticmethod(_memory.connect)
-
-
-# Workspace / Memory / Session 是 Protocol · attach 工厂方法到模块级名字
-# 用法: from akong_agent_harness import Workspace; Workspace.connect("ag_x")
-Workspace.connect = staticmethod(_workspace.connect)  # type: ignore[attr-defined]
-Memory.connect = staticmethod(_memory.connect)  # type: ignore[attr-defined]
-Session.connect = staticmethod(_session.connect)  # type: ignore[attr-defined]
+_sys.modules[__name__ + ".llm"] = _llm_pkg
+_sys.modules[__name__ + ".memory"] = _memory_pkg
+_sys.modules[__name__ + ".session"] = _session_pkg
+_sys.modules[__name__ + ".skills"] = _skills_pkg
+_sys.modules[__name__ + ".tools"] = _tools_pkg
+_sys.modules[__name__ + ".runtime"] = _runtime_pkg
+_sys.modules[__name__ + ".workspace"] = _workspace_pkg
 
 
 __all__ = [

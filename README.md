@@ -2,6 +2,33 @@
 
 通用 agent harness · LLM 周围的软件基础设施 · 跨平台 · 跨 fake 平台一致 (cast / B 站 fake / 抖音 fake / ...)。
 
+## v0.2.0 · meta-package (老板 5-9 拍激进版 8 仓拆)
+
+**v0.2.0 起本仓不再 own 实现** · 拆成 8 个独立 GitHub repo · 本仓只 re-export · 老 import 仍兼容:
+
+| 子仓 | 内容 |
+|---|---|
+| [akong-llm](https://github.com/yarnovo/akong-llm) | LLMClient · OpenAICompatibleClient · AnthropicClient · ChatResponse |
+| [akong-memory](https://github.com/yarnovo/akong-memory) | Memory · MemoryEntry · RdsAdapter |
+| [akong-session](https://github.com/yarnovo/akong-session) | Session · InMemorySession · RdsSession · SessionUnavailable |
+| [akong-workspace](https://github.com/yarnovo/akong-workspace) | Workspace · LocalFsAdapter |
+| [akong-skills](https://github.com/yarnovo/akong-skills) | Skill · SkillRegistry · parse_skill_md |
+| [akong-tools](https://github.com/yarnovo/akong-tools) | Tools · ToolSpec · register_tool · builtin tools |
+| [akong-runtime](https://github.com/yarnovo/akong-runtime) | run · tick · AgentDef · RunResult |
+| [akong-pickup](https://github.com/yarnovo/akong-pickup) | run_with_pickup · mid-loop pickup (用户连发新消息自动 inject) |
+
+```python
+# 老用法仍兼容 (走本仓 re-export)
+from akong_agent_harness import LLMClient, RdsSession, run, AgentDef
+
+# 新用法 · 直接 import 子仓 (减少 transitive 依赖)
+from akong_llm import LLMClient
+from akong_session import RdsSession
+from akong_runtime import run, AgentDef
+```
+
+
+
 ## 6 件套抽象 (架构.md §2 + REQ-001 改造) + 2 件新核心
 
 agent (LLM 一端) 不直接读写 fs / DB / OSS · 走这 8 个高层接口:

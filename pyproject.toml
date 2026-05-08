@@ -1,15 +1,18 @@
 [project]
 name = "akong-agent-harness"
-version = "0.1.0"
-description = "通用 agent harness · LLM 周围的软件基础设施 · workspace + memory + tools + skills + llm + session + runtime 7 件套 · 跨平台"
+version = "0.2.0"
+description = "通用 agent harness · meta-package · 8 仓拆分后兼容层 (akong-llm/memory/session/workspace/skills/tools/runtime/pickup re-export) · 老板 5-9 拍激进版"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "openai==2.36.0",
-    "anthropic>=0.40.0,<1.0.0",
-    "httpx==0.28.1",
-    "python-dateutil==2.9.0.post0",
-    "pyyaml>=6.0,<7.0",
+    "akong-llm @ git+https://github.com/yarnovo/akong-llm.git@main",
+    "akong-memory @ git+https://github.com/yarnovo/akong-memory.git@main",
+    "akong-session @ git+https://github.com/yarnovo/akong-session.git@main",
+    "akong-workspace @ git+https://github.com/yarnovo/akong-workspace.git@main",
+    "akong-skills @ git+https://github.com/yarnovo/akong-skills.git@main",
+    "akong-tools @ git+https://github.com/yarnovo/akong-tools.git@main",
+    "akong-runtime @ git+https://github.com/yarnovo/akong-runtime.git@main",
+    "akong-pickup @ git+https://github.com/yarnovo/akong-pickup.git@main",
 ]
 
 [dependency-groups]
@@ -26,6 +29,9 @@ asyncio_mode = "auto"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/akong_agent_harness"]
